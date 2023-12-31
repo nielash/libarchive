@@ -522,6 +522,10 @@ archive_write_zip_header(struct archive_write *a, struct archive_entry *entry)
 	int ret, ret2 = ARCHIVE_OK;
 	mode_t type;
 	int version_needed = 10;
+	ret = ARCHIVE_OK;
+	const void *mac_metadata;
+	size_t mac_metadata_size;
+	int r;
 
 	/* Ignore types of entries that we don't support. */
 	type = archive_entry_filetype(entry);
@@ -589,6 +593,119 @@ archive_write_zip_header(struct archive_write *a, struct archive_entry *entry)
 		}
 	}
 
+	/*
+	 * If Mac OS metadata blob is here, recurse to write that
+	 * as a separate entry.  This is really a pretty poor design:
+	 * In particular, it doubles the overhead for long filenames.
+	 * TODO: Help Apple folks design something better and figure
+	 * out how to transition from this legacy format.
+	 *
+	 * Note that this code is present on every platform; clients
+	 * on non-Mac are unlikely to ever provide this data, but
+	 * applications that copy entries from one archive to another
+	 * should not lose data just because the local filesystem
+	 * can't store it.
+	 */
+	mac_metadata =
+	    archive_entry_mac_metadata(entry, &mac_metadata_size);
+	if (mac_metadata != NULL) {
+		const char *oname;
+		char *name, *bname;
+		size_t name_length;
+		struct archive_entry *extra = archive_entry_new2(&a->archive);
+
+		oname = archive_entry_pathname(entry);
+		name_length = strlen(oname);
+		name = malloc(name_length + 3);
+		if (name == NULL || extra == NULL) {
+			/* XXX error message */
+			archive_entry_free(extra);
+			free(name);
+			return (ARCHIVE_FAILED);
+		}
+		strcpy(name, oname);
+		/* Find last '/'; strip trailing '/' characters */
+		bname = strrchr(name, '/');
+		while (bname != NULL && bname[1] == '\0') {
+			*bname = '\0';
+			bname = strrchr(name, '/');
+		}
+		if (bname == NULL) {
+			memmove(name + 2, name, name_length + 1);
+			memmove(name, "._", 2);
+		} else {
+			bname += 1;
+			memmove(bname + 2, bname, strlen(bname) + 1);
+			memmove(bname, "._", 2);
+		}
+
+		// FIXME: I added this part -- not confident it's correct!:
+		if (bname == NULL) {
+			name = malloc(11 + strlen(oname));
+			sprintf(name, "%s%s", "__MACOSX/._", oname);
+		} else {
+			size_t substr_len;
+			substr_len = strlen(oname) - strlen(bname);
+			char substr[substr_len + 1];
+			strncpy(substr,oname+(0),substr_len + 1);
+
+			name = malloc(10 + substr_len + strlen(bname));
+			sprintf(name, "%s%s%s%s", "__MACOSX/", substr, "/", bname);
+		}
+
+		archive_entry_copy_pathname(extra, name);
+		free(name);
+
+		archive_entry_set_size(extra, mac_metadata_size);
+		archive_entry_set_filetype(extra, AE_IFREG);
+		archive_entry_set_perm(extra,
+		    archive_entry_perm(entry));
+		archive_entry_set_mtime(extra,
+		    archive_entry_mtime(entry),
+		    archive_entry_mtime_nsec(entry));
+		archive_entry_set_gid(extra,
+		    archive_entry_gid(entry));
+		archive_entry_set_gname(extra,
+		    archive_entry_gname(entry));
+		archive_entry_set_uid(extra,
+		    archive_entry_uid(entry));
+		archive_entry_set_uname(extra,
+		    archive_entry_uname(entry));
+
+		/* Recurse to write the special copyfile entry. */
+		r = archive_write_zip_header(a, extra);
+		archive_entry_free(extra);
+		if (r < ARCHIVE_WARN)
+			return (r);
+		if (r < ret)
+			ret = r;
+		r = (int)archive_write_zip_data(a, mac_metadata,
+		    mac_metadata_size);
+		if (r < ARCHIVE_WARN)
+			return (r);
+		if (r < ret)
+			ret = r;
+		r = archive_write_zip_finish_entry(a);
+		if (r < ARCHIVE_WARN)
+			return (r);
+		if (r < ret)
+			ret = r;
+
+		// FIXME: Copy & pasted from elsewhere in this file:
+		/* Reset information from last entry. */
+		zip->entry_offset = zip->written_bytes;
+		zip->entry_uncompressed_limit = INT64_MAX;
+		zip->entry_compressed_size = 0;
+		zip->entry_uncompressed_size = 0;
+		zip->entry_compressed_written = 0;
+		zip->entry_uncompressed_written = 0;
+		zip->entry_flags = 0;
+		zip->entry_uses_zip64 = 0;
+		zip->entry_crc32 = zip->crc32func(0, NULL, 0);
+		zip->entry_encryption = 0;
+		archive_entry_free(zip->entry);
+		zip->entry = NULL;
+	}
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
 	/* Make sure the path separators in pathname, hardlink and symlink
